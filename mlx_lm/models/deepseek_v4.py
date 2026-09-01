@@ -2555,13 +2555,12 @@ class DeepseekV4Model(nn.Module):
 
         for i, layer in enumerate(self.layers):
             h = layer(h, cache[i], inputs)
-            # Eval and clear after each layer during prefill (S > 1)
-            # to limit computation graph size. Without this, the graph
-            # accumulates all 43 layers' operations before eval, causing
-            # ~34 GB of intermediate activations for MoE layers.
+            # Realize one layer at a time during prefill to bound the lazy
+            # computation graph without draining MLX's reusable allocator
+            # buffers. The shared prefill loop clears the allocator after each
+            # prompt chunk.
             if S > 1:
                 mx.eval(h)
-                mx.clear_cache()
 
         h = self.hc_head(h)
         return self.norm(h)
