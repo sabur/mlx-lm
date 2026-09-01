@@ -1475,6 +1475,16 @@ class TestModels(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _parse_prefill_cache_limit(value)
 
+    def test_deepseek_v4_compiled_offset(self):
+        from mlx_lm.models.deepseek_v4 import _as_compiled_offset
+
+        scalar_offset = _as_compiled_offset(4096)
+        array_offset = _as_compiled_offset(mx.array([4096, 8192]))
+        self.assertEqual(scalar_offset.shape, ())
+        self.assertEqual(scalar_offset.dtype, mx.int32)
+        self.assertEqual(array_offset.shape, (2,))
+        self.assertEqual(array_offset.dtype, mx.int32)
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
         from mlx_lm.models.cache import RotatingKVCache

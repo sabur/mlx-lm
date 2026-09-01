@@ -55,6 +55,14 @@ def _prefill_cache_limit_reached(cache_memory: int, limit: int) -> bool:
     return limit > 0 and cache_memory >= limit
 
 
+def _as_compiled_offset(offset) -> mx.array:
+    # Array arguments remain dynamic across mx.compile calls; Python integers
+    # specialize the graph for every new prompt position.
+    if isinstance(offset, mx.array):
+        return offset.astype(mx.int32)
+    return mx.array(offset, dtype=mx.int32)
+
+
 # Register a minimal HF config so AutoConfig / AutoTokenizer recognize
 # ``deepseek_v4`` until huggingface/transformers#45616 merges. Once that PR
 # ships, this registration becomes a no-op (``exist_ok=True``).
@@ -1702,7 +1710,7 @@ class Compressor(nn.Module):
                 new_pooled,
                 self.norm.weight,
                 self.norm.eps,
-                int(pool_base) // ratio,
+                _as_compiled_offset(int(pool_base) // ratio),
                 self.rope_head_dim,
                 float(ratio),
                 self.rope.freqs,
@@ -2157,8 +2165,12 @@ class V4Attention(nn.Module):
         if isinstance(offset, mx.array):
             offset = offset + 0
 
+        compiled_offset = _as_compiled_offset(offset)
+
         # Fused: partial-RoPE on q + kv in one compiled call.
-        q, kv = _attn_qkv_partial_rope(q, kv, offset, rd, self.rope.freqs)
+        q, kv = _attn_qkv_partial_rope(
+            q, kv, compiled_offset, rd, self.rope.freqs
+        )
 
         if self.compress_ratio:
             if v4_cache is None:
@@ -2249,7 +2261,11 @@ class V4Attention(nn.Module):
         # Fused: inverse-RoPE on the trailing rd dims + transpose-and-reshape
         # to [B, S, n_heads*head_dim] for wo_a.
         o = _attn_inv_rope_flatten(
-            o, offset, rd, self.rope.freqs, self.n_heads * self.head_dim
+            o,
+            compiled_offset,
+            rd,
+            self.rope.freqs,
+            self.n_heads * self.head_dim,
         )
         # Both wo_a and wo_b mxfp4 → single compile graph for the chain.
         if (
