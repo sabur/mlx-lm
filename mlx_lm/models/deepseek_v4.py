@@ -2556,9 +2556,8 @@ class DeepseekV4Model(nn.Module):
         for i, layer in enumerate(self.layers):
             h = layer(h, cache[i], inputs)
             # Realize one layer at a time during prefill to bound the lazy
-            # computation graph without draining MLX's reusable allocator
-            # buffers. The shared prefill loop clears the allocator after each
-            # prompt chunk.
+            # computation graph while keeping reusable allocator buffers warm
+            # between layers. The caller owns any coarser clearing policy.
             if S > 1:
                 mx.eval(h)
 
