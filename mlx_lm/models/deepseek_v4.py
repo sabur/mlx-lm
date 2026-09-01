@@ -2579,6 +2579,28 @@ class Model(nn.Module):
         self, inputs: mx.array, cache: Optional[List[Any]] = None
     ) -> mx.array:
         h = self.model(inputs, cache)
+
+        # DeepSeek-V4 Metal residency fix: materialize all cache arrays
+        # after each forward pass. The compressor/indexer PoolingCache
+        # (concat-grow) and RotatingKVCache (slice-assign) build
+        # un-detached lazy graphs during decode -- each step's update
+        # keeps the prior step's Metal buffer referenced, hitting
+        # Metal's resource_limit (499000 live buffers) at ~11.3K tokens.
+        # Eval of every cache array here cuts those chains so the
+        # live-buffer count stays bounded (~200 -> ~3 KB/step).
+        # See ml-explore/mlx-lm#1332 and Blaizzy/mlx-lm#25.
+        if cache is not None:
+            _cache_arrays = []
+            for _c in cache:
+                for _leaf in (getattr(_c, "caches", None) or (_c,)):
+                    if _leaf is None:
+                        continue
+                    for _v in vars(_leaf).values():
+                        if isinstance(_v, mx.array):
+                            _cache_arrays.append(_v)
+            if _cache_arrays:
+                mx.eval(*_cache_arrays)
+
         return self.lm_head(h)
 
     @property
