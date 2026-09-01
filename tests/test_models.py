@@ -1457,6 +1457,24 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.abs(row_sums - 1.0) < 1e-3))
         self.assertTrue(mx.all(mx.abs(col_sums - 1.0) < 1e-3))
 
+    def test_deepseek_v4_prefill_cache_limit(self):
+        from mlx_lm.models.deepseek_v4 import (
+            _GIB,
+            _parse_prefill_cache_limit,
+            _prefill_cache_limit_reached,
+        )
+
+        self.assertEqual(_parse_prefill_cache_limit("0"), 0)
+        self.assertEqual(_parse_prefill_cache_limit("1.5"), int(1.5 * _GIB))
+        self.assertFalse(_prefill_cache_limit_reached(16 * _GIB, 0))
+        self.assertFalse(_prefill_cache_limit_reached(15 * _GIB, 16 * _GIB))
+        self.assertTrue(_prefill_cache_limit_reached(16 * _GIB, 16 * _GIB))
+
+        for value in ("invalid", "-1", "nan", "inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _parse_prefill_cache_limit(value)
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
         from mlx_lm.models.cache import RotatingKVCache

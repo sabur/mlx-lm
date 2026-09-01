@@ -1,4 +1,6 @@
+import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -9,12 +11,48 @@ from .base import BaseModelArgs, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
 from .switch_layers import SwitchGLU
 
+logger = logging.getLogger(__name__)
+
 # State-key constants used by the Compressor / Indexer when reading and
 # writing into a DeepseekV4Cache. The cache keeps one independent set of
 # per-key state (buffer_kv, buffer_gate, prev_kv, prev_gate, pool and the
 # corresponding per-row length lists) for each of these.
 _K_COMP = "compressor"
 _K_IDX = "indexer"
+
+_PREFILL_CACHE_LIMIT_ENV = "MLXLM_DEEPSEEK_V4_PREFILL_CACHE_LIMIT_GIB"
+_DEFAULT_PREFILL_CACHE_LIMIT_GIB = 16.0
+_GIB = 1 << 30
+
+
+def _parse_prefill_cache_limit(value: str) -> int:
+    try:
+        limit_gib = float(value)
+    except ValueError as e:
+        raise ValueError(
+            f"{_PREFILL_CACHE_LIMIT_ENV} must be a non-negative number, "
+            f"got {value!r}"
+        ) from e
+
+    if not math.isfinite(limit_gib) or limit_gib < 0:
+        raise ValueError(
+            f"{_PREFILL_CACHE_LIMIT_ENV} must be a finite non-negative number, "
+            f"got {limit_gib!r}"
+        )
+
+    return int(limit_gib * _GIB)
+
+
+def _prefill_cache_limit_bytes() -> int:
+    value = os.getenv(
+        _PREFILL_CACHE_LIMIT_ENV,
+        str(_DEFAULT_PREFILL_CACHE_LIMIT_GIB),
+    )
+    return _parse_prefill_cache_limit(value)
+
+
+def _prefill_cache_limit_reached(cache_memory: int, limit: int) -> bool:
+    return limit > 0 and cache_memory >= limit
 
 
 # Register a minimal HF config so AutoConfig / AutoTokenizer recognize
@@ -2540,6 +2578,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_head = HyperHead(
             args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
         )
+        self.prefill_cache_limit = _prefill_cache_limit_bytes()
 
     def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
         B, S = inputs.shape
@@ -2557,9 +2596,24 @@ class DeepseekV4Model(nn.Module):
             h = layer(h, cache[i], inputs)
             # Realize one layer at a time during prefill to bound the lazy
             # computation graph while keeping reusable allocator buffers warm
-            # between layers. The caller owns any coarser clearing policy.
+            # between layers. Clear only under allocator pressure so long
+            # prefills cannot grow the cache without bound.
             if S > 1:
                 mx.eval(h)
+                if self.prefill_cache_limit > 0:
+                    cache_memory = mx.get_cache_memory()
+                    if _prefill_cache_limit_reached(
+                        cache_memory, self.prefill_cache_limit
+                    ):
+                        logger.info(
+                            "DeepSeek V4 prefill clearing %.1f GiB allocator cache "
+                            "at layer %d/%d (limit %.1f GiB)",
+                            cache_memory / _GIB,
+                            i + 1,
+                            len(self.layers),
+                            self.prefill_cache_limit / _GIB,
+                        )
+                        mx.clear_cache()
 
         h = self.hc_head(h)
         return self.norm(h)
