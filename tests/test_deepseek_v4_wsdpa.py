@@ -10,6 +10,10 @@ import mlx.core as mx
 
 from mlx_lm.models import deepseek_v4_wsdpa as wsdpa
 
+_METAL_AVAILABLE = (
+    mx.default_device() == mx.gpu and hasattr(mx, "metal") and mx.metal.is_available()
+)
+
 
 def _reset_wsdpa():
     wsdpa._ENABLED = True
@@ -207,7 +211,7 @@ class TestDeepseekV4WsdpaState(unittest.TestCase):
                 )
 
 
-@unittest.skipUnless(mx.metal.is_available(), "Metal is required")
+@unittest.skipUnless(_METAL_AVAILABLE, "Metal is required")
 class TestDeepseekV4WsdpaMetal(unittest.TestCase):
     def setUp(self):
         _reset_wsdpa()
