@@ -9,6 +9,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
+from .deepseek_v4_wsdpa import wsdpa_prefill, wsdpa_topk_prefill
 from .switch_layers import SwitchGLU
 
 logger = logging.getLogger(__name__)
@@ -1905,6 +1906,11 @@ def _compressed_visibility(
     return comp_visible[:, None, :, :]
 
 
+def _fused_topk_indices(indices: mx.array) -> mx.array:
+    """Preserve the Indexer's selected set while ordering it for WSDPA."""
+    return mx.sort(indices.astype(mx.uint32), axis=-1)
+
+
 # Attention-side compile fuses (per-layer cost reduction). These collapse the
 # sequence  matmul → reshape/transpose/slice → norm → (rope)  into single
 # compiled kernels so each prefill attention call shaves several dispatches.
@@ -2199,64 +2205,98 @@ class V4Attention(nn.Module):
             indexer_topk = None
 
         window_len = window_kv.shape[1]
-        # Decode (S=1) fast path: gather the Indexer's top-k compressed rows
-        # directly into SDPA's key tensor so the kernel only attends to those
-        # K rows + the window. For prefill (S>1) fall back to attending to the
-        # full compressed buffer with a scatter-based mask — the gather-flat
-        # approach would over-include across query positions, changing output.
-        use_gather = (
-            S == 1 and compressed_len > 0 and indexer_topk is not None
-        )
-        if use_gather:
-            d = compressed.shape[-1]
-            # take_along_axis on a broadcast of the pool is ~15% faster at b=1
-            # than reshape+flat-gather (specialized fused kernel vs fancy-index).
-            expanded = mx.broadcast_to(
-                compressed[:, None, None, :, :], (B, 1, S, compressed_len, d)
-            )
-            idx = mx.broadcast_to(
-                indexer_topk[:, None, :, :, None],
-                (B, 1, S, indexer_topk.shape[-1], d),
-            )
-            gathered = mx.take_along_axis(expanded, idx, axis=3).reshape(B, -1, d)
-            kv_all = mx.concatenate([window_kv, gathered], axis=1)
-        elif compressed_len > 0:
-            kv_all = mx.concatenate([window_kv, compressed], axis=1)
-        else:
-            kv_all = window_kv
+        sinks = self._sink_for(q.dtype)
+        o = None
 
-        # Decode (S=1): every token in the window cache is valid past context
-        # and we're not doing causal masking (only one query), so skip the
-        # window mask entirely. For the gather path the Indexer already
-        # returns only valid indices (no -1 padding), so no compressed mask
-        # either.
-        if S == 1:
-            # Pool rows are emitted only after a full window of raw tokens
-            # has been processed, so at any decode step every pool row is in
-            # the past — no compressed-visibility mask needed.
-            mask = None
-        else:
-            win_mask = _build_window_mask(B, S, offset, self.window, window_len)
-            if compressed_len > 0:
-                comp_mask = _compressed_visibility(
-                    B, S, offset, compressed_len, self.compress_ratio
+        use_fused_prefill = (
+            S > 1
+            and B == 1
+            and not isinstance(offset, mx.array)
+            and q.dtype == mx.bfloat16
+            and self.n_heads in (8, 16, 32, 64)
+            and self.head_dim == 512
+        )
+        if use_fused_prefill:
+            local_kv = window_kv[:, None, :, :]
+            if compressed_len > 0 and indexer_topk is not None:
+                o = wsdpa_topk_prefill(
+                    q,
+                    local_kv,
+                    compressed,
+                    _fused_topk_indices(indexer_topk),
+                    sinks,
+                    self.scale,
+                    int(offset),
+                    self.window,
+                    self.compress_ratio,
                 )
-                if indexer_topk is not None:
-                    k_range = mx.arange(compressed_len, dtype=mx.int32)
-                    selected = (
-                        indexer_topk[..., None] == k_range[None, None, None, :]
-                    ).any(axis=-2)[:, None, :, :]
-                    comp_mask = comp_mask & selected
-                mask = mx.concatenate([win_mask, comp_mask], axis=-1)
             else:
-                mask = win_mask
+                o = wsdpa_prefill(
+                    q,
+                    local_kv,
+                    compressed if compressed_len > 0 else None,
+                    sinks,
+                    self.scale,
+                    int(offset),
+                    self.window,
+                    self.compress_ratio or 1,
+                )
 
-        kv_all_4d = kv_all[:, None, :, :]
-        o = scaled_dot_product_attention(
-            q, kv_all_4d, kv_all_4d,
-            cache=None, scale=self.scale, mask=mask,
-            sinks=self._sink_for(q.dtype),
-        )
+        if o is None:
+            # Decode gathers the Indexer's selected compressed rows directly.
+            use_gather = (
+                S == 1 and compressed_len > 0 and indexer_topk is not None
+            )
+            if use_gather:
+                d = compressed.shape[-1]
+                expanded = mx.broadcast_to(
+                    compressed[:, None, None, :, :],
+                    (B, 1, S, compressed_len, d),
+                )
+                idx = mx.broadcast_to(
+                    indexer_topk[:, None, :, :, None],
+                    (B, 1, S, indexer_topk.shape[-1], d),
+                )
+                gathered = mx.take_along_axis(expanded, idx, axis=3).reshape(
+                    B, -1, d
+                )
+                kv_all = mx.concatenate([window_kv, gathered], axis=1)
+            elif compressed_len > 0:
+                kv_all = mx.concatenate([window_kv, compressed], axis=1)
+            else:
+                kv_all = window_kv
+
+            if S == 1:
+                mask = None
+            else:
+                win_mask = _build_window_mask(
+                    B, S, offset, self.window, window_len
+                )
+                if compressed_len > 0:
+                    comp_mask = _compressed_visibility(
+                        B, S, offset, compressed_len, self.compress_ratio
+                    )
+                    if indexer_topk is not None:
+                        k_range = mx.arange(compressed_len, dtype=mx.int32)
+                        selected = (
+                            indexer_topk[..., None]
+                            == k_range[None, None, None, :]
+                        ).any(axis=-2)[:, None, :, :]
+                        comp_mask = comp_mask & selected
+                    mask = mx.concatenate([win_mask, comp_mask], axis=-1)
+                else:
+                    mask = win_mask
+
+            kv_all_4d = kv_all[:, None, :, :]
+            o = scaled_dot_product_attention(
+                q,
+                kv_all_4d,
+                kv_all_4d,
+                cache=None,
+                scale=self.scale,
+                mask=mask,
+                sinks=sinks,
+            )
 
         # Fused: inverse-RoPE on the trailing rd dims + transpose-and-reshape
         # to [B, S, n_heads*head_dim] for wo_a.

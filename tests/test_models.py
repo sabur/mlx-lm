@@ -1485,6 +1485,20 @@ class TestModels(unittest.TestCase):
         self.assertEqual(array_offset.shape, (2,))
         self.assertEqual(array_offset.dtype, mx.int32)
 
+    def test_deepseek_v4_fused_topk_indices(self):
+        from mlx_lm.models.deepseek_v4 import _fused_topk_indices
+
+        indices = mx.array([[[3, 1, 2], [7, 4, 6]]], dtype=mx.int32)
+        fused = _fused_topk_indices(indices)
+
+        self.assertEqual(fused.dtype, mx.uint32)
+        self.assertTrue(
+            mx.array_equal(
+                fused,
+                mx.array([[[1, 2, 3], [4, 6, 7]]], dtype=mx.uint32),
+            )
+        )
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
         from mlx_lm.models.cache import RotatingKVCache
