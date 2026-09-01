@@ -2595,25 +2595,10 @@ class DeepseekV4Model(nn.Module):
         for i, layer in enumerate(self.layers):
             h = layer(h, cache[i], inputs)
             # Realize one layer at a time during prefill to bound the lazy
-            # computation graph while keeping reusable allocator buffers warm
-            # between layers. Clear only under allocator pressure so long
-            # prefills cannot grow the cache without bound.
+            # computation graph while keeping reusable allocator buffers warm.
+            # The outer model checks allocator pressure once per forward.
             if S > 1:
                 mx.eval(h)
-                if self.prefill_cache_limit > 0:
-                    cache_memory = mx.get_cache_memory()
-                    if _prefill_cache_limit_reached(
-                        cache_memory, self.prefill_cache_limit
-                    ):
-                        logger.info(
-                            "DeepSeek V4 prefill clearing %.1f GiB allocator cache "
-                            "at layer %d/%d (limit %.1f GiB)",
-                            cache_memory / _GIB,
-                            i + 1,
-                            len(self.layers),
-                            self.prefill_cache_limit / _GIB,
-                        )
-                        mx.clear_cache()
 
         h = self.hc_head(h)
         return self.norm(h)
@@ -2641,17 +2626,31 @@ class Model(nn.Module):
         # Eval of every cache array here cuts those chains so the
         # live-buffer count stays bounded (~200 -> ~3 KB/step).
         # See ml-explore/mlx-lm#1332 and Blaizzy/mlx-lm#25.
+        arrays_to_eval = [h] if inputs.shape[1] > 1 else []
         if cache is not None:
-            _cache_arrays = []
             for _c in cache:
                 for _leaf in (getattr(_c, "caches", None) or (_c,)):
                     if _leaf is None:
                         continue
                     for _v in vars(_leaf).values():
                         if isinstance(_v, mx.array):
-                            _cache_arrays.append(_v)
-            if _cache_arrays:
-                mx.eval(*_cache_arrays)
+                            arrays_to_eval.append(_v)
+        if arrays_to_eval:
+            mx.eval(*arrays_to_eval)
+
+        if inputs.shape[1] > 1 and self.model.prefill_cache_limit > 0:
+            cache_memory = mx.get_cache_memory()
+            if _prefill_cache_limit_reached(
+                cache_memory, self.model.prefill_cache_limit
+            ):
+                logger.info(
+                    "DeepSeek V4 prefill clearing %.1f GiB allocator cache "
+                    "after %d-token forward (limit %.1f GiB)",
+                    cache_memory / _GIB,
+                    inputs.shape[1],
+                    self.model.prefill_cache_limit / _GIB,
+                )
+                mx.clear_cache()
 
         return self.lm_head(h)
 
