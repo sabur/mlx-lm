@@ -1871,7 +1871,7 @@ def main():
     parser.add_argument(
         "--prompt-cache-size",
         type=int,
-        default=4,
+        default=10,
         help="Maximum number of distinct KV caches to hold in the prompt cache",
     )
     parser.add_argument(

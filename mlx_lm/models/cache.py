@@ -1660,7 +1660,7 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 4, max_bytes: int = 1 << 63):
+    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._trie = PromptTrie()
