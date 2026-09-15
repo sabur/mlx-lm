@@ -1485,6 +1485,27 @@ class TestModels(unittest.TestCase):
         self.assertEqual(array_offset.shape, (2,))
         self.assertEqual(array_offset.dtype, mx.int32)
 
+    def test_deepseek_v4_collects_nested_cache_arrays(self):
+        from mlx_lm.models import deepseek_v4
+
+        cache = deepseek_v4.DeepseekV4Cache(sliding_window=8)
+        cache.local.keys = mx.zeros((1, 1, 2, 4))
+        cache.local.values = mx.ones((1, 1, 2, 4))
+        compressor_branch = cache._branches[deepseek_v4._K_COMP]
+        compressor_branch.pool = mx.full((1, 2, 4), 2)
+        compressor_branch.buffer_kv = compressor_branch.pool
+        indexer_branch = cache._branches[deepseek_v4._K_IDX]
+        indexer_branch.buffer_gate = mx.full((1, 2), 3)
+
+        arrays = deepseek_v4._collect_cache_arrays([cache])
+        array_ids = {id(array) for array in arrays}
+
+        self.assertEqual(len(arrays), 4)
+        self.assertIn(id(cache.local.keys), array_ids)
+        self.assertIn(id(cache.local.values), array_ids)
+        self.assertIn(id(compressor_branch.pool), array_ids)
+        self.assertIn(id(indexer_branch.buffer_gate), array_ids)
+
     def test_deepseek_v4_fused_topk_indices(self):
         from mlx_lm.models.deepseek_v4 import _fused_topk_indices
 

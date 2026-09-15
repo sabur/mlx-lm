@@ -2660,6 +2660,36 @@ class DeepseekV4Model(nn.Module):
         return self.norm(h)
 
 
+def _collect_cache_arrays(value: Any) -> List[mx.array]:
+    arrays: List[mx.array] = []
+    seen: set[int] = set()
+
+    def visit(item: Any):
+        item_id = id(item)
+        if item_id in seen:
+            return
+        seen.add(item_id)
+
+        if isinstance(item, mx.array):
+            arrays.append(item)
+        elif isinstance(item, dict):
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+        elif hasattr(item, "__dict__"):
+            for nested in vars(item).values():
+                visit(nested)
+        elif hasattr(item, "__slots__"):
+            for slot in item.__slots__:
+                if hasattr(item, slot):
+                    visit(getattr(item, slot))
+
+    visit(value)
+    return arrays
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -2684,13 +2714,7 @@ class Model(nn.Module):
         # See ml-explore/mlx-lm#1332 and Blaizzy/mlx-lm#25.
         arrays_to_eval = [h] if inputs.shape[1] > 1 else []
         if cache is not None:
-            for _c in cache:
-                for _leaf in (getattr(_c, "caches", None) or (_c,)):
-                    if _leaf is None:
-                        continue
-                    for _v in vars(_leaf).values():
-                        if isinstance(_v, mx.array):
-                            arrays_to_eval.append(_v)
+            arrays_to_eval.extend(_collect_cache_arrays(cache))
         if arrays_to_eval:
             mx.eval(*arrays_to_eval)
 
