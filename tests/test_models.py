@@ -1506,6 +1506,26 @@ class TestModels(unittest.TestCase):
         self.assertIn(id(compressor_branch.pool), array_ids)
         self.assertIn(id(indexer_branch.buffer_gate), array_ids)
 
+    def test_deepseek_v4_materializes_nested_cache_arrays_only_during_decode(self):
+        from mlx_lm.models import deepseek_v4
+
+        cache = deepseek_v4.DeepseekV4Cache(sliding_window=8)
+        cache.local.keys = mx.zeros((1, 1, 2, 4))
+        cache.local.values = mx.ones((1, 1, 2, 4))
+        cache._branches[deepseek_v4._K_COMP].pool = mx.full((1, 2, 4), 2)
+
+        prefill_arrays = deepseek_v4._cache_arrays_to_materialize(
+            [cache],
+            decode=False,
+        )
+        decode_arrays = deepseek_v4._cache_arrays_to_materialize(
+            [cache],
+            decode=True,
+        )
+
+        self.assertEqual(prefill_arrays, [])
+        self.assertEqual(len(decode_arrays), 3)
+
     def test_deepseek_v4_fused_topk_indices(self):
         from mlx_lm.models.deepseek_v4 import _fused_topk_indices
 

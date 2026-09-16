@@ -2690,6 +2690,27 @@ def _collect_cache_arrays(value: Any) -> List[mx.array]:
     return arrays
 
 
+def _cache_arrays_to_materialize(
+    cache: List[Any],
+    *,
+    decode: bool,
+) -> List[mx.array]:
+    if decode:
+        return _collect_cache_arrays(cache)
+
+    arrays: List[mx.array] = []
+    for cache_entry in cache:
+        for leaf in (getattr(cache_entry, "caches", None) or (cache_entry,)):
+            if leaf is None:
+                continue
+            arrays.extend(
+                value
+                for value in vars(leaf).values()
+                if isinstance(value, mx.array)
+            )
+    return arrays
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -2703,18 +2724,22 @@ class Model(nn.Module):
     ) -> mx.array:
         h = self.model(inputs, cache)
 
-        # DeepSeek-V4 Metal residency fix: materialize all cache arrays
-        # after each forward pass. The compressor/indexer PoolingCache
-        # (concat-grow) and RotatingKVCache (slice-assign) build
-        # un-detached lazy graphs during decode -- each step's update
-        # keeps the prior step's Metal buffer referenced, hitting
-        # Metal's resource_limit (499000 live buffers) at ~11.3K tokens.
-        # Eval of every cache array here cuts those chains so the
-        # live-buffer count stays bounded (~200 -> ~3 KB/step).
+        # DeepSeek-V4 Metal residency fix: nested compressor/indexer and
+        # local-cache updates build lazy graphs during one-token decode.
+        # Materialize those nested arrays on decode to cut the chains that
+        # otherwise hit Metal's resource limit at ~11.3K generated tokens.
+        # Large prefills retain the original shallow behavior; recursively
+        # evaluating the full V4 state there causes excessive active-memory
+        # peaks without addressing the decode-specific graph growth.
         # See ml-explore/mlx-lm#1332 and Blaizzy/mlx-lm#25.
         arrays_to_eval = [h] if inputs.shape[1] > 1 else []
         if cache is not None:
-            arrays_to_eval.extend(_collect_cache_arrays(cache))
+            arrays_to_eval.extend(
+                _cache_arrays_to_materialize(
+                    cache,
+                    decode=inputs.shape[1] == 1,
+                )
+            )
         if arrays_to_eval:
             mx.eval(*arrays_to_eval)
 
